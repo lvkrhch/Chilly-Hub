@@ -12,6 +12,10 @@ local UserInputService = game:GetService("UserInputService")
 local Teams = game:GetService("Teams")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Lighting = game:GetService("Lighting")
+local VirtualInputManager
+pcall(function()
+    VirtualInputManager = game:GetService("VirtualInputManager")
+end)
 
 local LocalPlayer = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
@@ -126,11 +130,55 @@ local autoClickInterval = 0.001
 local autoClickBatchLimit = 25
 local autoClickAccumulator = 0
 local autoClickCount = 0
+local autoClickMode = "Auto"
+local autoClickPayloadMode = "Auto"
+local autoClickTapDetectEnabled = true
+local autoClickScanInterval = 1.5
+local autoClickLastScan = 0
+local autoClickStatusParagraph
+local updateAutoClickStatus
+local autoClickLastResult = "Idle"
+local autoClickUiPauseUntil = 0
+local autoClickPanicKey = Enum.KeyCode.RightShift
+local autoClickVirtualFrameLock = true
+local detectedTapSystem = {
+    Mode = "None",
+    Name = "Not detected",
+    Instance = nil,
+    Payload = "Auto",
+    Score = 0
+}
 
 local lowGraphicsEnabled = false
 local originalGraphics = {
     Lighting = {},
+    Rendering = {},
     Instances = {}
+}
+local lowGraphicsConnections = {}
+local lowGraphicsPreserveRenderDistance = true
+local desyncEnabled = false
+local desyncMode = "Jitter"
+local desyncStrength = 8
+local desyncRate = 0.12
+local desyncAccumulator = 0
+local desyncDirection = 1
+local desyncOriginalAutoRotate
+local updateDesync
+
+local ballisticAutoDetectEnabled = true
+local ballisticScanInterval = 1
+local ballisticLastScan = 0
+local ballisticLastWeapon
+local ballisticInfoParagraph
+local autoDetectBallistics
+local detectedBallistics = {
+    Weapon = "None",
+    Speed = bulletSpeed,
+    DropEnabled = bulletDropEnabled,
+    DropScale = bulletDropScale,
+    Source = "Manual/default",
+    Found = 0
 }
 
 local function notify(title, content)
@@ -618,7 +666,8 @@ local function getPredictedAimPosition(part)
         return position
     end
 
-    local origin = Camera and Camera.CFrame.Position or (root() and root().Position)
+    local localRoot = getRoot()
+    local origin = Camera and Camera.CFrame.Position or (localRoot and localRoot.Position)
     if not origin then return position end
 
     local distance = (position - origin).Magnitude
@@ -1080,9 +1129,29 @@ local function updateCombatAndMovement()
 end
 
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed then return end
-
     local key = input.KeyCode
+
+    if key == autoClickPanicKey and autoClickEnabled then
+        autoClickEnabled = false
+        autoClickAccumulator = 0
+        autoClickLastResult = "Panic stopped by RightShift"
+        if updateAutoClickStatus then
+            updateAutoClickStatus()
+        end
+        notify("Chilly", "Auto Click OFF. Panic key: RightShift.")
+        return
+    end
+
+    if key == Enum.KeyCode.K and autoClickEnabled then
+        autoClickUiPauseUntil = os.clock() + 1.25
+        autoClickAccumulator = 0
+        autoClickLastResult = "Paused for UI"
+        if updateAutoClickStatus then
+            updateAutoClickStatus()
+        end
+    end
+
+    if gameProcessed then return end
 
     if key == Enum.KeyCode.W then keys.W = true end
     if key == Enum.KeyCode.A then keys.A = true end
@@ -1107,7 +1176,7 @@ UserInputService.InputEnded:Connect(function(input)
     if key == Enum.KeyCode.LeftControl or key == Enum.KeyCode.LeftShift or key == Enum.KeyCode.Q then keys.Down = false end
 end)
 
-RunService.Heartbeat:Connect(function()
+RunService.Heartbeat:Connect(function(deltaTime)
     if not antiKickFriendly then
         applyWalkSpeed()
         applyJumpBoost()
@@ -1119,7 +1188,331 @@ RunService.Heartbeat:Connect(function()
     if noRecoilEnabled or noShakeEnabled or noReloadEnabled then
         applyWeaponAssist()
     end
+
+    autoDetectBallistics(false)
+    if updateDesync then
+        updateDesync(deltaTime)
+    end
 end)
+
+local function normalizeTapKey(name)
+    return string.lower(tostring(name or "")):gsub("[%s_%-]", "")
+end
+
+local function getInstancePath(instance)
+    if not instance then
+        return "None"
+    end
+
+    local ok, path = pcall(function()
+        return instance:GetFullName()
+    end)
+
+    return ok and path or tostring(instance)
+end
+
+local function scoreTapInstance(instance)
+    local key = normalizeTapKey(instance.Name)
+    local score = 0
+
+    if key == "chillyautoclick" then score += 200 end
+    if key:find("tap") then score += 90 end
+    if key:find("click") then score += 90 end
+    if key:find("clicker") then score += 60 end
+    if key:find("press") then score += 35 end
+    if key:find("touch") then score += 25 end
+
+    if key:find("buy") or key:find("purchase") or key:find("trade") or key:find("delete") or key:find("sell") then
+        score -= 120
+    end
+
+    local parent = instance.Parent
+    if parent then
+        local parentKey = normalizeTapKey(parent.Name)
+        if parentKey:find("remote") or parentKey:find("event") then score += 10 end
+        if parentKey:find("tap") or parentKey:find("click") then score += 25 end
+    end
+
+    return score
+end
+
+local function scoreTapButton(button)
+    local score = scoreTapInstance(button)
+
+    pcall(function()
+        local text = normalizeTapKey(button.Text)
+        if text:find("tap") then score += 80 end
+        if text:find("click") then score += 80 end
+    end)
+
+    return score
+end
+
+updateAutoClickStatus = function()
+    if not autoClickStatusParagraph then
+        return
+    end
+
+    local instanceStatus = detectedTapSystem.Instance and detectedTapSystem.Instance.Parent and getInstancePath(detectedTapSystem.Instance) or detectedTapSystem.Name
+
+    pcall(function()
+        autoClickStatusParagraph:Set({
+            Title = "Tap System Detector",
+            Content = string.format(
+                "Mode: %s\nTarget: %s\nPayload: %s\nScore: %d\nClicks: %d\nLast: %s",
+                detectedTapSystem.Mode,
+                instanceStatus,
+                detectedTapSystem.Payload,
+                detectedTapSystem.Score,
+                autoClickCount,
+                autoClickLastResult
+            )
+        })
+    end)
+end
+
+local function chooseAutoClickPayload(mode, instance)
+    if mode == "Virtual Tap" or mode == "Detected Button" then
+        return "Input"
+    end
+
+    if autoClickPayloadMode ~= "Auto" then
+        return autoClickPayloadMode
+    end
+
+    if instance and instance.Name == "ChillyAutoClick" then
+        return "Table"
+    end
+
+    if mode == "Custom Hook" then
+        return "Table"
+    end
+
+    return "None"
+end
+
+local function scanTapSystem(force)
+    if not autoClickTapDetectEnabled and not force then
+        return {
+            Mode = "None",
+            Name = "Auto detect off",
+            Instance = nil,
+            Payload = "Auto",
+            Score = 0
+        }
+    end
+
+    local now = os.clock()
+    if not force and now - autoClickLastScan < autoClickScanInterval and detectedTapSystem.Mode ~= "None" then
+        if not detectedTapSystem.Instance or detectedTapSystem.Instance.Parent then
+            return detectedTapSystem
+        end
+    end
+
+    autoClickLastScan = now
+
+    local best = {
+        Mode = "None",
+        Name = "Not detected",
+        Instance = nil,
+        Payload = "Auto",
+        Score = 0
+    }
+
+    local wantsAuto = autoClickMode == "Auto"
+
+    if autoClickMode == "Virtual Tap" then
+        best = {
+            Mode = "Virtual Tap",
+            Name = "Screen center",
+            Instance = nil,
+            Payload = chooseAutoClickPayload("Virtual Tap"),
+            Score = 850
+        }
+    end
+
+    if (wantsAuto or autoClickMode == "Custom Hook") and typeof(_G.Chilly_AutoClickAction) == "function" then
+        best = {
+            Mode = "Custom Hook",
+            Name = "_G.Chilly_AutoClickAction",
+            Instance = nil,
+            Payload = chooseAutoClickPayload("Custom Hook"),
+            Score = 1000
+        }
+    end
+
+    if wantsAuto or autoClickMode == "Chilly Remote" then
+        local remote = ReplicatedStorage:FindFirstChild("ChillyAutoClick")
+        if remote and remote:IsA("RemoteEvent") and best.Score < 900 then
+            best = {
+                Mode = "Chilly Remote",
+                Name = getInstancePath(remote),
+                Instance = remote,
+                Payload = chooseAutoClickPayload("Chilly Remote", remote),
+                Score = 900
+            }
+        end
+    end
+
+    if wantsAuto or autoClickMode == "Detected Remote" then
+        for _, item in ipairs(ReplicatedStorage:GetDescendants()) do
+            if item:IsA("RemoteEvent") then
+                local score = scoreTapInstance(item)
+                if score > best.Score and score >= 70 then
+                    best = {
+                        Mode = "Detected Remote",
+                        Name = getInstancePath(item),
+                        Instance = item,
+                        Payload = chooseAutoClickPayload("Detected Remote", item),
+                        Score = score
+                    }
+                end
+            end
+        end
+    end
+
+    if wantsAuto or autoClickMode == "Detected Button" then
+        local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+        if playerGui then
+            for _, item in ipairs(playerGui:GetDescendants()) do
+                if item:IsA("TextButton") or item:IsA("ImageButton") then
+                    local score = scoreTapButton(item)
+                    if score > best.Score and score >= 80 then
+                        best = {
+                            Mode = "Detected Button",
+                            Name = getInstancePath(item),
+                            Instance = item,
+                            Payload = "GuiSignal",
+                            Score = score
+                        }
+                    end
+                end
+            end
+        end
+    end
+
+    detectedTapSystem = best
+    updateAutoClickStatus()
+    return detectedTapSystem
+end
+
+local function getTapPosition(system, fallbackCenter)
+    if system and system.Instance and system.Instance.Parent and (system.Instance:IsA("TextButton") or system.Instance:IsA("ImageButton")) then
+        local position = system.Instance.AbsolutePosition
+        local size = system.Instance.AbsoluteSize
+        return Vector2.new(position.X + size.X / 2, position.Y + size.Y / 2)
+    end
+
+    return fallbackCenter
+end
+
+local function sendVirtualTap(position)
+    if not VirtualInputManager then
+        return false, "Virtual input unavailable"
+    end
+
+    local ok = pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(position.X, position.Y, 0, true, game, 0)
+        task.wait()
+        VirtualInputManager:SendMouseButtonEvent(position.X, position.Y, 0, false, game, 0)
+    end)
+
+    if ok then
+        return true, "Virtual mouse tap"
+    end
+
+    ok = pcall(function()
+        VirtualInputManager:SendTouchEvent(0, Enum.UserInputState.Begin, position.X, position.Y)
+        task.wait()
+        VirtualInputManager:SendTouchEvent(0, Enum.UserInputState.End, position.X, position.Y)
+    end)
+
+    if ok then
+        return true, "Virtual touch tap"
+    end
+
+    return false, "Virtual input unavailable"
+end
+
+local function fireAutoClickSystem(system, center)
+    if system.Mode == "Virtual Tap" then
+        local ok, message = sendVirtualTap(center)
+        autoClickLastResult = message
+        updateAutoClickStatus()
+        return ok
+    end
+
+    if system.Mode == "Custom Hook" and typeof(_G.Chilly_AutoClickAction) == "function" then
+        pcall(_G.Chilly_AutoClickAction, {
+            Position = center,
+            Count = autoClickCount,
+            Source = "Chilly",
+            Mode = "TapAuto"
+        })
+        autoClickLastResult = "Custom hook fired"
+        updateAutoClickStatus()
+        return true
+    end
+
+    if system.Instance and system.Instance.Parent and system.Instance:IsA("RemoteEvent") then
+        local payload = system.Payload
+        if payload == "Table" then
+            pcall(function()
+                system.Instance:FireServer({
+                    Position = center,
+                    Count = autoClickCount,
+                    Source = "Chilly",
+                    Mode = "TapAuto"
+                })
+            end)
+        elseif payload == "Position" then
+            pcall(function()
+                system.Instance:FireServer(center)
+            end)
+        elseif payload == "Count" then
+            pcall(function()
+                system.Instance:FireServer(autoClickCount)
+            end)
+        else
+            pcall(function()
+                system.Instance:FireServer()
+            end)
+        end
+
+        autoClickLastResult = "RemoteEvent fired"
+        updateAutoClickStatus()
+        return true
+    end
+
+    if system.Mode == "Detected Button" and system.Instance and system.Instance.Parent then
+        local position = getTapPosition(system, center)
+        local ok, message = sendVirtualTap(position)
+
+        if not ok and typeof(firesignal) == "function" then
+            ok = pcall(function()
+                firesignal(system.Instance.Activated)
+            end)
+
+            message = ok and "Button signal fired" or message
+        end
+
+        if not ok and typeof(firesignal) == "function" then
+            pcall(function()
+                firesignal(system.Instance.MouseButton1Click)
+            end)
+            ok = true
+            message = "Button mouse signal fired"
+        end
+
+        autoClickLastResult = message
+        updateAutoClickStatus()
+        return ok
+    end
+
+    autoClickLastResult = "No supported tap target"
+    updateAutoClickStatus()
+    return false
+end
 
 local function runAutoClickPulse()
     Camera = workspace.CurrentCamera
@@ -1128,12 +1521,22 @@ local function runAutoClickPulse()
     local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
     autoClickCount += 1
 
+    local system = scanTapSystem(false)
+    if fireAutoClickSystem(system, center) then
+        if autoClickCount % 25 == 0 then
+            updateAutoClickStatus()
+        end
+        return
+    end
+
     if typeof(_G.Chilly_AutoClickAction) == "function" then
         pcall(_G.Chilly_AutoClickAction, {
             Position = center,
             Count = autoClickCount,
             Source = "Chilly"
         })
+        autoClickLastResult = "Fallback custom hook fired"
+        updateAutoClickStatus()
         return
     end
 
@@ -1144,6 +1547,11 @@ local function runAutoClickPulse()
             Count = autoClickCount,
             Source = "Chilly"
         })
+        autoClickLastResult = "Fallback ChillyAutoClick fired"
+        updateAutoClickStatus()
+    else
+        autoClickLastResult = "No tap system found"
+        updateAutoClickStatus()
     end
 end
 
@@ -1190,12 +1598,20 @@ end
 
 local function isBulletSpeedKey(name)
     local key = normalizeWeaponKey(name)
-    return key:find("bulletspeed") or key:find("projectilespeed") or key:find("velocity") or key:find("muzzlevelocity")
+    if key:find("reload") or key:find("firerate") or key:find("walk") or key:find("sprint") or key:find("aim") or key:find("scope") then
+        return false
+    end
+
+    return key:find("bulletspeed") or key:find("projectilespeed") or key:find("projectilevelocity") or key:find("bulletvelocity") or key:find("muzzlevelocity") or key == "speed" or key == "velocity"
 end
 
 local function isBulletDropKey(name)
     local key = normalizeWeaponKey(name)
-    return key:find("bulletdrop") or key:find("drop") or key:find("gravity")
+    if key:find("body") or key:find("player") or key:find("world") then
+        return false
+    end
+
+    return key:find("bulletdrop") or key:find("projectiledrop") or key:find("drop") or key:find("gravity") or key:find("bulletgravity") or key:find("projectilegravity")
 end
 
 local function patchValueObject(valueObject, newValue)
@@ -1235,55 +1651,222 @@ local function patchConfigTable(tbl)
     end
 end
 
+local function getDropScaleFromValue(name, value)
+    local numeric = tonumber(value) or 0
+    local absolute = math.abs(numeric)
+    local key = normalizeWeaponKey(name)
+
+    if absolute == 0 then
+        return 0
+    end
+
+    if key:find("gravity") or absolute > 10 then
+        return math.clamp(absolute / math.max(workspace.Gravity, 1), 0, 5)
+    end
+
+    return math.clamp(absolute, 0, 5)
+end
+
+local function recordBallisticCandidate(result, name, value, source)
+    if typeof(name) ~= "string" or typeof(value) ~= "number" then
+        return
+    end
+
+    if isBulletSpeedKey(name) and value > 0 then
+        result.Speed = value
+        result.SpeedSource = source .. "." .. name
+    elseif isBulletDropKey(name) then
+        result.DropEnabled = value ~= 0
+        result.DropScale = getDropScaleFromValue(name, value)
+        result.DropSource = source .. "." .. name
+    end
+end
+
+local function scanBallisticsTable(tbl, source, result, depth)
+    if typeof(tbl) ~= "table" or depth > 4 then
+        return
+    end
+
+    for key, value in pairs(tbl) do
+        local keyName = tostring(key)
+
+        if typeof(value) == "number" then
+            currentWeaponData[source .. "." .. keyName] = value
+            result.Found += 1
+            recordBallisticCandidate(result, keyName, value, source)
+        elseif typeof(value) == "boolean" or typeof(value) == "string" then
+            currentWeaponData[source .. "." .. keyName] = value
+            result.Found += 1
+        elseif typeof(value) == "table" then
+            scanBallisticsTable(value, source .. "." .. keyName, result, depth + 1)
+        end
+    end
+end
+
+local function scanBallisticsAttributes(instance, source, result)
+    for key, value in pairs(instance:GetAttributes()) do
+        currentWeaponData[source .. "@" .. key] = value
+        result.Found += 1
+
+        if typeof(value) == "number" then
+            recordBallisticCandidate(result, key, value, source .. "@Attributes")
+        end
+    end
+end
+
+local function scanWeaponBallistics(weapon, shouldPatchModules)
+    local result = {
+        Weapon = weapon and weapon.Name or "None",
+        Speed = nil,
+        SpeedSource = nil,
+        DropEnabled = nil,
+        DropScale = nil,
+        DropSource = nil,
+        Found = 0
+    }
+
+    if not weapon then
+        return result
+    end
+
+    scanBallisticsAttributes(weapon, weapon.Name, result)
+
+    for _, item in ipairs(weapon:GetDescendants()) do
+        scanBallisticsAttributes(item, item.Name, result)
+
+        if item:IsA("NumberValue") or item:IsA("IntValue") then
+            local key = item.Name
+            currentWeaponData[key] = item.Value
+            result.Found += 1
+            recordBallisticCandidate(result, key, item.Value, item.Name)
+        elseif item:IsA("BoolValue") then
+            currentWeaponData[item.Name] = item.Value
+            result.Found += 1
+        elseif item:IsA("ModuleScript") then
+            local ok, data = pcall(require, item)
+            if ok and typeof(data) == "table" then
+                currentWeaponData[item.Name] = data
+                result.Found += 1
+
+                if shouldPatchModules then
+                    patchConfigTable(data)
+                end
+
+                scanBallisticsTable(data, item.Name, result, 1)
+            end
+        end
+    end
+
+    return result
+end
+
+local function updateBallisticsInfo()
+    if not ballisticInfoParagraph then
+        return
+    end
+
+    pcall(function()
+        ballisticInfoParagraph:Set({
+            Title = "Detected Ballistics",
+            Content = string.format(
+                "Weapon: %s\nBullet Speed: %.0f stud/s\nBullet Drop: %s (scale %.2f)\nSource: %s\nData scanned: %d",
+                detectedBallistics.Weapon or "None",
+                bulletSpeed,
+                bulletDropEnabled and "ON" or "OFF",
+                bulletDropScale,
+                detectedBallistics.Source or "Manual/default",
+                detectedBallistics.Found or 0
+            )
+        })
+    end)
+end
+
+local function applyBallisticResult(result, silent)
+    if not result then
+        return false
+    end
+
+    local changed = false
+    local sources = {}
+
+    if result.Speed and result.Speed > 0 then
+        changed = changed or bulletSpeed ~= result.Speed
+        bulletSpeed = result.Speed
+        table.insert(sources, "speed=" .. tostring(result.SpeedSource or "unknown"))
+    end
+
+    if result.DropEnabled ~= nil then
+        changed = changed or bulletDropEnabled ~= result.DropEnabled or bulletDropScale ~= result.DropScale
+        bulletDropEnabled = result.DropEnabled
+        bulletDropScale = result.DropScale or bulletDropScale
+        table.insert(sources, "drop=" .. tostring(result.DropSource or "unknown"))
+    end
+
+    detectedBallistics = {
+        Weapon = result.Weapon or "None",
+        Speed = bulletSpeed,
+        DropEnabled = bulletDropEnabled,
+        DropScale = bulletDropScale,
+        Source = #sources > 0 and table.concat(sources, " | ") or "Manual/default",
+        Found = result.Found or 0
+    }
+
+    updateBallisticsInfo()
+
+    if changed and not silent then
+        notify("Chilly", string.format("Ballistics auto: %s | speed %.0f | drop %.2f", detectedBallistics.Weapon, bulletSpeed, bulletDropScale))
+    end
+
+    return changed
+end
+
 local function readWeaponData()
     currentWeapon = getEquippedWeapon()
     currentWeaponData = {}
     table.clear(patchedWeaponValues)
 
     if not currentWeapon then
+        detectedBallistics.Weapon = "None"
+        detectedBallistics.Source = "Weapon not found"
+        detectedBallistics.Found = 0
+        updateBallisticsInfo()
         notify("Chilly", "Weapon tidak ditemukan. Equip weapon dulu lalu klik Read Weapon Data.")
         return
     end
 
-    local found = 0
+    local result = scanWeaponBallistics(currentWeapon, true)
+    applyBallisticResult(result, true)
 
-    for _, item in ipairs(currentWeapon:GetDescendants()) do
-        if item:IsA("NumberValue") or item:IsA("IntValue") then
-            local key = item.Name
-            currentWeaponData[key] = item.Value
-            found += 1
+    notify("Chilly", "Weapon dibaca: " .. currentWeapon.Name .. " | data: " .. tostring(result.Found))
+end
 
-            if isBulletSpeedKey(key) and item.Value > 0 then
-                bulletSpeed = item.Value
-            elseif isBulletDropKey(key) then
-                bulletDropEnabled = item.Value ~= 0
-                bulletDropScale = math.clamp(math.abs(item.Value) / math.max(workspace.Gravity, 1), 0, 5)
-            end
-        elseif item:IsA("BoolValue") then
-            currentWeaponData[item.Name] = item.Value
-            found += 1
-        elseif item:IsA("ModuleScript") then
-            local ok, data = pcall(require, item)
-            if ok and typeof(data) == "table" then
-                currentWeaponData[item.Name] = data
-                patchConfigTable(data)
-                found += 1
-
-                for key, value in pairs(data) do
-                    if typeof(key) == "string" and typeof(value) == "number" then
-                        if isBulletSpeedKey(key) and value > 0 then
-                            bulletSpeed = value
-                        elseif isBulletDropKey(key) then
-                            bulletDropEnabled = value ~= 0
-                            bulletDropScale = math.clamp(math.abs(value) / math.max(workspace.Gravity, 1), 0, 5)
-                        end
-                    end
-                end
-            end
-        end
+autoDetectBallistics = function(force)
+    if not ballisticAutoDetectEnabled and not force then
+        return
     end
 
-    notify("Chilly", "Weapon dibaca: " .. currentWeapon.Name .. " | data: " .. tostring(found))
+    local now = os.clock()
+    local weapon = getEquippedWeapon()
+
+    if not force and weapon == ballisticLastWeapon and now - ballisticLastScan < ballisticScanInterval then
+        return
+    end
+
+    ballisticLastWeapon = weapon
+    ballisticLastScan = now
+    currentWeapon = weapon
+    currentWeaponData = {}
+
+    if not weapon then
+        detectedBallistics.Weapon = "None"
+        detectedBallistics.Source = "Weapon not found"
+        detectedBallistics.Found = 0
+        updateBallisticsInfo()
+        return
+    end
+
+    local result = scanWeaponBallistics(weapon, false)
+    applyBallisticResult(result, true)
 end
 
 local function applyWeaponAssist()
@@ -1321,6 +1904,8 @@ end
 
 local function analyzePredictionSettings()
     Camera = workspace.CurrentCamera
+    autoDetectBallistics(true)
+
     local player, part = getCurrentAimTarget()
 
     if not player or not part then
@@ -1328,7 +1913,8 @@ local function analyzePredictionSettings()
         return
     end
 
-    local origin = Camera and Camera.CFrame.Position or (root() and root().Position)
+    local localRoot = getRoot()
+    local origin = Camera and Camera.CFrame.Position or (localRoot and localRoot.Position)
     if not origin then
         notify("Chilly", "Camera/root tidak tersedia.")
         return
@@ -1340,6 +1926,7 @@ local function analyzePredictionSettings()
     local targetSpeed = velocity.Magnitude
     local travelTime = distance / math.max(bulletSpeed, 1)
     local leadStuds = targetSpeed * travelTime
+    local dropCompensation = bulletDropEnabled and (0.5 * workspace.Gravity * travelTime * travelTime * bulletDropScale) or 0
 
     aimPredictionEnabled = true
     predictionStrength = math.clamp(predictionStrength, 0.5, 1.5)
@@ -1347,15 +1934,51 @@ local function analyzePredictionSettings()
     notify(
         "Chilly",
         string.format(
-            "Prediction check | Target: %s | Distance: %.0f studs | Speed: %.0f studs/s | Bullet: %.0f studs/s | Travel: %.2fs | Lead: %.1f studs",
+            "Prediction check | Target: %s | Distance: %.0f studs | Target speed: %.0f | Bullet: %.0f | Drop: %s %.2f | Travel: %.2fs | Lead: %.1f | Up aim: %.1f",
             player.Name,
             distance,
             targetSpeed,
             bulletSpeed,
+            bulletDropEnabled and "ON" or "OFF",
+            bulletDropScale,
             travelTime,
-            leadStuds
+            leadStuds,
+            dropCompensation
         )
     )
+end
+
+local function disconnectLowGraphicsConnections()
+    for _, connection in ipairs(lowGraphicsConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+
+    table.clear(lowGraphicsConnections)
+end
+
+local function applyLowGraphicsToInstance(item)
+    if item:IsA("BasePart") then
+        if not originalGraphics.Instances[item] then
+            originalGraphics.Instances[item] = {
+                Material = item.Material,
+                Reflectance = item.Reflectance
+            }
+        end
+        item.Material = Enum.Material.SmoothPlastic
+        item.Reflectance = 0
+    elseif item:IsA("Decal") or item:IsA("Texture") then
+        if not originalGraphics.Instances[item] then
+            originalGraphics.Instances[item] = {Transparency = item.Transparency}
+        end
+        item.Transparency = 1
+    elseif item:IsA("ParticleEmitter") or item:IsA("Trail") or item:IsA("Beam") then
+        if not originalGraphics.Instances[item] then
+            originalGraphics.Instances[item] = {Enabled = item.Enabled}
+        end
+        item.Enabled = false
+    end
 end
 
 local function setLowGraphics(enabled)
@@ -1367,38 +1990,44 @@ local function setLowGraphics(enabled)
         originalGraphics.Lighting.Brightness = Lighting.Brightness
 
         pcall(function()
-            settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+            originalGraphics.Rendering.QualityLevel = settings().Rendering.QualityLevel
         end)
+        pcall(function()
+            originalGraphics.Rendering.StreamingTargetRadius = workspace.StreamingTargetRadius
+        end)
+
+        if lowGraphicsPreserveRenderDistance then
+            pcall(function()
+                settings().Rendering.QualityLevel = Enum.QualityLevel.Level21
+            end)
+            pcall(function()
+                workspace.StreamingTargetRadius = math.max(workspace.StreamingTargetRadius, 2048)
+            end)
+        else
+            pcall(function()
+                settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+            end)
+        end
 
         Lighting.GlobalShadows = false
         Lighting.FogEnd = 100000
         Lighting.Brightness = math.max(Lighting.Brightness, 1)
 
         for _, item in ipairs(workspace:GetDescendants()) do
-            if item:IsA("BasePart") then
-                if not originalGraphics.Instances[item] then
-                    originalGraphics.Instances[item] = {
-                        Material = item.Material,
-                        Reflectance = item.Reflectance
-                    }
-                end
-                item.Material = Enum.Material.SmoothPlastic
-                item.Reflectance = 0
-            elseif item:IsA("Decal") or item:IsA("Texture") then
-                if not originalGraphics.Instances[item] then
-                    originalGraphics.Instances[item] = {Transparency = item.Transparency}
-                end
-                item.Transparency = 1
-            elseif item:IsA("ParticleEmitter") or item:IsA("Trail") or item:IsA("Beam") then
-                if not originalGraphics.Instances[item] then
-                    originalGraphics.Instances[item] = {Enabled = item.Enabled}
-                end
-                item.Enabled = false
-            end
+            applyLowGraphicsToInstance(item)
         end
 
-        notify("Chilly", "Low Graphics ON.")
+        disconnectLowGraphicsConnections()
+        table.insert(lowGraphicsConnections, workspace.DescendantAdded:Connect(function(item)
+            if lowGraphicsEnabled then
+                task.defer(applyLowGraphicsToInstance, item)
+            end
+        end))
+
+        notify("Chilly", lowGraphicsPreserveRenderDistance and "Low Graphics ON. Render distance tetap jauh." or "Low Graphics ON.")
     else
+        disconnectLowGraphicsConnections()
+
         for item, data in pairs(originalGraphics.Instances) do
             if item and item.Parent then
                 pcall(function()
@@ -1417,7 +2046,80 @@ local function setLowGraphics(enabled)
             Lighting.Brightness = originalGraphics.Lighting.Brightness
         end)
 
+        pcall(function()
+            if originalGraphics.Rendering.QualityLevel then
+                settings().Rendering.QualityLevel = originalGraphics.Rendering.QualityLevel
+            end
+        end)
+        pcall(function()
+            if originalGraphics.Rendering.StreamingTargetRadius then
+                workspace.StreamingTargetRadius = originalGraphics.Rendering.StreamingTargetRadius
+            end
+        end)
+
         notify("Chilly", "Low Graphics OFF.")
+    end
+end
+
+local function setDesync(enabled)
+    desyncEnabled = enabled
+
+    local humanoid = getHumanoid()
+    if enabled then
+        if humanoid and desyncOriginalAutoRotate == nil then
+            desyncOriginalAutoRotate = humanoid.AutoRotate
+        end
+
+        desyncAccumulator = 0
+        desyncDirection = 1
+        notify("Chilly", "Desync simulator ON.")
+    else
+        if humanoid and desyncOriginalAutoRotate ~= nil then
+            pcall(function()
+                humanoid.AutoRotate = desyncOriginalAutoRotate
+            end)
+        end
+
+        desyncOriginalAutoRotate = nil
+        notify("Chilly", "Desync simulator OFF.")
+    end
+end
+
+updateDesync = function(deltaTime)
+    if not desyncEnabled then
+        return
+    end
+
+    local root = getRoot()
+    local humanoid = getHumanoid()
+    if not root or not humanoid then
+        return
+    end
+
+    if desyncOriginalAutoRotate == nil then
+        desyncOriginalAutoRotate = humanoid.AutoRotate
+    end
+
+    desyncAccumulator += deltaTime
+    if desyncAccumulator < desyncRate then
+        return
+    end
+
+    desyncAccumulator = 0
+    desyncDirection *= -1
+
+    local strength = desyncStrength
+    if antiKickFriendly and autoSafetyGuard then
+        strength = math.min(strength, 12)
+    end
+
+    if desyncMode == "Jitter" then
+        root.CFrame = root.CFrame + (root.CFrame.RightVector * strength * desyncDirection)
+    elseif desyncMode == "Backstep" then
+        root.CFrame = root.CFrame + (root.CFrame.LookVector * -strength)
+    elseif desyncMode == "Spin" then
+        humanoid.AutoRotate = false
+        root.CFrame = root.CFrame * CFrame.Angles(0, math.rad(120 * desyncDirection), 0)
     end
 end
 
@@ -1435,11 +2137,25 @@ RunService.Heartbeat:Connect(function(deltaTime)
         return
     end
 
+    if os.clock() < autoClickUiPauseUntil then
+        autoClickAccumulator = 0
+        return
+    end
+
     autoClickAccumulator += deltaTime
 
+    local activeInterval = autoClickInterval
+    local activeBatchLimit = autoClickBatchLimit
+    local virtualModeActive = autoClickMode == "Virtual Tap" or autoClickMode == "Detected Button" or detectedTapSystem.Mode == "Virtual Tap" or detectedTapSystem.Mode == "Detected Button"
+
+    if autoClickVirtualFrameLock and virtualModeActive then
+        activeInterval = math.max(activeInterval, 0.05)
+        activeBatchLimit = 1
+    end
+
     local fired = 0
-    while autoClickAccumulator >= autoClickInterval and fired < autoClickBatchLimit do
-        autoClickAccumulator -= autoClickInterval
+    while autoClickAccumulator >= activeInterval and fired < activeBatchLimit do
+        autoClickAccumulator -= activeInterval
         fired += 1
         runAutoClickPulse()
     end
@@ -1835,6 +2551,34 @@ CombatTab:CreateSlider({
     end
 })
 
+CombatTab:CreateToggle({
+    Name = "Auto Detect Ballistics",
+    CurrentValue = true,
+    Flag = "Chilly_AutoDetectBallistics",
+    Callback = function(value)
+        ballisticAutoDetectEnabled = value
+        if value then
+            autoDetectBallistics(true)
+        end
+    end
+})
+
+CombatTab:CreateButton({
+    Name = "Refresh Ballistics",
+    Callback = function()
+        autoDetectBallistics(true)
+        notify("Chilly", string.format("Ballistics: speed %.0f | drop %s %.2f", bulletSpeed, bulletDropEnabled and "ON" or "OFF", bulletDropScale))
+    end
+})
+
+pcall(function()
+    ballisticInfoParagraph = CombatTab:CreateParagraph({
+        Title = "Detected Ballistics",
+        Content = "Weapon: None\nBullet Speed: 900 stud/s\nBullet Drop: OFF (scale 1.00)\nSource: Manual/default\nData scanned: 0"
+    })
+    updateBallisticsInfo()
+end)
+
 CombatTab:CreateButton({
     Name = "Check Best Prediction",
     Callback = function()
@@ -2135,14 +2879,88 @@ AutoClickTab:CreateSlider({
     end
 })
 
+AutoClickTab:CreateToggle({
+    Name = "Tap System Auto Detect",
+    CurrentValue = true,
+    Flag = "Chilly_TapSystemAutoDetect",
+    Callback = function(value)
+        autoClickTapDetectEnabled = value
+        if value then
+            scanTapSystem(true)
+        end
+    end
+})
+
+AutoClickTab:CreateDropdown({
+    Name = "Click Mode",
+    Options = {"Auto", "Virtual Tap", "Custom Hook", "Chilly Remote", "Detected Remote", "Detected Button"},
+    CurrentOption = {"Auto"},
+    MultipleOptions = false,
+    Flag = "Chilly_AutoClickMode",
+    Callback = function(option)
+        autoClickMode = typeof(option) == "table" and option[1] or option
+        scanTapSystem(true)
+    end
+})
+
+AutoClickTab:CreateDropdown({
+    Name = "Tap Payload",
+    Options = {"Auto", "None", "Table", "Position", "Count"},
+    CurrentOption = {"Auto"},
+    MultipleOptions = false,
+    Flag = "Chilly_AutoClickPayload",
+    Callback = function(option)
+        autoClickPayloadMode = typeof(option) == "table" and option[1] or option
+        scanTapSystem(true)
+    end
+})
+
+AutoClickTab:CreateButton({
+    Name = "Detect Tap System",
+    Callback = function()
+        scanTapSystem(true)
+        notify("Chilly", "Tap system: " .. detectedTapSystem.Mode .. " | " .. detectedTapSystem.Name .. " | nyalakan Auto Click atau Test Tap Once.")
+    end
+})
+
+AutoClickTab:CreateButton({
+    Name = "Test Tap Once",
+    Callback = function()
+        scanTapSystem(true)
+        runAutoClickPulse()
+        notify("Chilly", "Tap test: " .. autoClickLastResult)
+    end
+})
+
+pcall(function()
+    autoClickStatusParagraph = AutoClickTab:CreateParagraph({
+        Title = "Tap System Detector",
+        Content = "Mode: None\nTarget: Not detected\nPayload: Auto\nScore: 0\nClicks: 0\nLast: Idle"
+    })
+    updateAutoClickStatus()
+end)
+
 pcall(function()
     AutoClickTab:CreateParagraph({
         Title = "Info",
-        Content = "Creator: Khai (chilly)\nAuto Click ini stat-only: tidak mengirim tap fisik ke tombol UI. Hubungkan ke _G.Chilly_AutoClickAction atau RemoteEvent ReplicatedStorage.ChillyAutoClick untuk menambah statistik clicker game kamu."
+        Content = "Creator: Khai (chilly)\nDetect hanya memilih target. Panic stop: RightShift. Saat tekan K untuk buka UI, Auto Click pause sebentar. Virtual Tap/Detected Button otomatis dibatasi biar tidak ngunci klik UI."
     })
 end)
 
 ExtraTab:CreateSection("Performance")
+
+ExtraTab:CreateToggle({
+    Name = "Keep Render Distance",
+    CurrentValue = true,
+    Flag = "Chilly_KeepRenderDistance",
+    Callback = function(value)
+        lowGraphicsPreserveRenderDistance = value
+        if lowGraphicsEnabled then
+            setLowGraphics(false)
+            setLowGraphics(true)
+        end
+    end
+})
 
 ExtraTab:CreateToggle({
     Name = "Low Graphics",
@@ -2150,6 +2968,52 @@ ExtraTab:CreateToggle({
     Flag = "Chilly_LowGraphics",
     Callback = function(value)
         setLowGraphics(value)
+    end
+})
+
+ExtraTab:CreateSection("Desync")
+
+ExtraTab:CreateToggle({
+    Name = "Desync Simulator",
+    CurrentValue = false,
+    Flag = "Chilly_Desync",
+    Callback = function(value)
+        setDesync(value)
+    end
+})
+
+ExtraTab:CreateDropdown({
+    Name = "Desync Mode",
+    Options = {"Jitter", "Backstep", "Spin"},
+    CurrentOption = {"Jitter"},
+    MultipleOptions = false,
+    Flag = "Chilly_DesyncMode",
+    Callback = function(option)
+        desyncMode = typeof(option) == "table" and option[1] or option
+    end
+})
+
+ExtraTab:CreateSlider({
+    Name = "Desync Strength",
+    Range = {1, 30},
+    Increment = 1,
+    Suffix = "studs",
+    CurrentValue = 8,
+    Flag = "Chilly_DesyncStrength",
+    Callback = function(value)
+        desyncStrength = value
+    end
+})
+
+ExtraTab:CreateSlider({
+    Name = "Desync Rate",
+    Range = {5, 50},
+    Increment = 1,
+    Suffix = "x10ms",
+    CurrentValue = 12,
+    Flag = "Chilly_DesyncRate",
+    Callback = function(value)
+        desyncRate = math.max(value, 1) / 100
     end
 })
 

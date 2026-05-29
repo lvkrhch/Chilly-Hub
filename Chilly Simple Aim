@@ -58,21 +58,21 @@ local settings = {
     hitboxSize = 8,
     hitboxShape = "Box", -- "Box" or "Ball"
     hitboxTargetMode = "Enemies", -- "Enemies", "Target", or "All"
-    hitboxTransparency = 0.94,
+    hitboxTransparency = 0,
 
     minWalkSpeed = 8,
-    maxWalkSpeed = 80,
+    maxWalkSpeed = 130,
     minJumpPower = 25,
-    maxJumpPower = 150,
+    maxJumpPower = 300,
     minFlySpeed = 20,
-    maxFlySpeed = 160,
+    maxFlySpeed = 500,
     minHitboxSize = 4,
-    maxHitboxSize = 18,
+    maxHitboxSize = 30,
 
-    walkSpeedStep = 4,
+    walkSpeedStep = 8,
     jumpPowerStep = 10,
-    flySpeedStep = 8,
-    hitboxSizeStep = 1,
+    flySpeedStep = 15,
+    hitboxSizeStep = 2,
 }
 
 local keyChoices = {
